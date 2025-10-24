@@ -1,0 +1,61 @@
+from freqtrade.strategy import IStrategy
+from freqtrade.freqai.prediction_models import LightGBMClassifier
+from pandas import DataFrame
+import talib.abstract as ta
+from functools import reduce
+import numpy as np
+
+class FreqAI_RSIHunter(IStrategy):
+    timeframe = '15m'
+    stoploss = -0.10
+    minimal_roi = {"0": 0.01}
+
+    freqai_model = LightGBMClassifier
+
+    def feature_engineering_expand_all(self, dataframe: DataFrame, period: int, metadata: dict, **kwargs) -> DataFrame:
+        dataframe[f"rsi_period_{period}"] = ta.RSI(dataframe, timeperiod=period)
+        dataframe[f"sma_period_{period}"] = ta.SMA(dataframe, timeperiod=period)
+        bb = ta.BBANDS(dataframe, timeperiod=period)
+        dataframe[f"bb_lower_{period}"] = bb[2]
+        dataframe[f"bb_middle_{period}"] = bb[1]
+        dataframe[f"bb_upper_{period}"] = bb[0]
+        dataframe[f"volume_sma_{period}"] = ta.SMA(dataframe['volume'], timeperiod=period)
+        dataframe[f"volume_ratio_{period}"] = dataframe['volume'] / dataframe[f"volume_sma_{period}"]
+        return dataframe
+
+    def feature_engineering_standard(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
+        dataframe["%-1h"] = dataframe["close"].pct_change(4)
+        dataframe["raw_volume"] = dataframe["volume"]
+        return dataframe
+
+    def set_freqai_targets(self, dataframe: DataFrame, metadata: dict, **kwargs) -> DataFrame:
+        dataframe["&-s_close"] = (
+            dataframe["close"].shift(-24) / dataframe["close"] - 1
+        ).fillna(0)
+        dataframe["do_predict"] = (dataframe["&-s_close"] > 0.01).astype(int)
+        return dataframe
+
+    def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
+        dataframe['rsi'] = ta.RSI(dataframe, timeperiod=14)
+        return dataframe
+
+    def populate_entry_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
+        enter_long_conditions = [
+            dataframe["do_predict"] == 1,
+            dataframe["&-predictions"] > 0.6
+        ]
+        dataframe.loc[
+            reduce(lambda x, y: x & y, enter_long_conditions),
+            'enter_long'
+        ] = 1
+        return dataframe
+
+    def populate_exit_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
+        exit_long_conditions = [
+            (dataframe["do_predict"] == 0) | (dataframe['rsi'] > 70)
+        ]
+        dataframe.loc[
+            reduce(lambda x, y: x | y, exit_long_conditions),
+            'exit_long'
+        ] = 1
+        return dataframe
