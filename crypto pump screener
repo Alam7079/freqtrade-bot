@@ -1,0 +1,840 @@
+import requests
+import pandas as pd
+import numpy as np
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+import warnings
+warnings.filterwarnings('ignore')
+
+# ==================== FIXED CONFIGURATION ====================
+CONFIG = {
+    'MIN_VOLUME': 1000000,
+    'MAX_VOLUME': 100000000,
+    'KLINE_LIMIT': 300,  # Increased for accurate RSI
+    'THREADS': 15,
+    'TIMEOUT': 10,
+  
+    # Price filters for low-cap coins
+    'MIN_PRICE': 0.0001,
+    'MAX_PRICE': 0.5,
+    'MIN_PRICE_CHANGE': 3.0,
+  
+    # Signal thresholds
+    'MIN_SCORE': 65,
+    'MIN_ADX': 20,
+    'MIN_VOLUME_SPIKE': 1.5,
+    'MIN_DMI_DIFF': 5,
+  
+    # RSI ranges - ONLY 70+ now
+    'RSI_OVERBOUGHT': 85,
+    'RSI_OVERSOLD': 30,
+    'MIN_RSI': 70,  # Changed to 70 minimum
+    'MAX_RSI': 85,  # Changed to 85 maximum
+}
+
+# ==================== API CLIENT ====================
+class APIClient:
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        })
+  
+    def fetch_json(self, url, params=None, max_retries=3):
+        for attempt in range(max_retries):
+            try:
+                response = self.session.get(url, params=params, timeout=CONFIG['TIMEOUT'])
+                if response.status_code == 200:
+                    return response.json()
+            except:
+                if attempt == max_retries - 1:
+                    return None
+                time.sleep(1)
+        return None
+
+api_client = APIClient()
+
+# ==================== ACCURATE RSI CALCULATION ====================
+def calculate_rsi_accurate(prices, period=14):
+    """
+    Accurate RSI calculation matching TradingView/Binance
+    Returns RSI values that match live market
+    """
+    if len(prices) < period + 1:
+        return np.zeros(len(prices))
+    
+    # Calculate price changes
+    deltas = np.diff(prices)
+    
+    # Separate gains and losses
+    seed = deltas[:period]
+    gain = np.where(seed > 0, seed, 0)
+    loss = np.where(seed < 0, -seed, 0)
+    
+    # Calculate initial averages
+    avg_gain = np.mean(gain)
+    avg_loss = np.mean(loss)
+    
+    # Initialize RSI array
+    rsi = np.zeros(len(prices))
+    rsi[:period] = 50  # Default initial value
+    
+    # Calculate RSI using Wilder's smoothing (EMA with alpha = 1/period)
+    for i in range(period, len(prices)):
+        if i < len(deltas):  # Check bounds
+            delta = deltas[i-1]
+        else:
+            delta = 0
+            
+        if delta > 0:
+            current_gain = delta
+            current_loss = 0
+        else:
+            current_gain = 0
+            current_loss = -delta
+        
+        # Wilder's smoothing formula
+        avg_gain = ((avg_gain * (period - 1)) + current_gain) / period
+        avg_loss = ((avg_loss * (period - 1)) + current_loss) / period
+        
+        # Calculate RS and RSI
+        if avg_loss == 0:
+            rsi[i] = 100
+        else:
+            rs = avg_gain / avg_loss
+            rsi[i] = 100 - (100 / (1 + rs))
+    
+    return rsi
+
+# ==================== GET SYMBOLS ====================
+def get_lowcap_symbols(exchange):
+    """Get low-cap symbols with momentum"""
+    if exchange == 'binance':
+        url = 'https://api.binance.com/api/v3/ticker/24hr'
+        data = api_client.fetch_json(url)
+    elif exchange == 'bitget':
+        url = 'https://api.bitget.com/api/v2/spot/market/tickers'
+        data = api_client.fetch_json(url)
+        if data:
+            data = data.get('data', [])
+    else:
+        return []
+
+    if not data:
+        return []
+  
+    symbols = []
+    for item in data:
+        try:
+            if exchange == 'binance':
+                if not item['symbol'].endswith('USDT'):
+                    continue
+                symbol = item['symbol']
+                vol = float(item.get('quoteVolume', 0))
+                price = float(item.get('lastPrice', 0))
+                change = float(item.get('priceChangePercent', 0))
+            elif exchange == 'bitget':
+                symbol = item['symbol']
+                if not symbol.endswith('USDT'):
+                    continue
+                vol = float(item.get('usdtVol', 0))
+                price = float(item.get('close', 0))
+                change = float(item.get('changeRate', 0)) * 100
+              
+            # Focus on low-cap, low price coins with momentum
+            if (CONFIG['MIN_VOLUME'] < vol < CONFIG['MAX_VOLUME'] and
+                CONFIG['MIN_PRICE'] < price < CONFIG['MAX_PRICE'] and
+                abs(change) > CONFIG['MIN_PRICE_CHANGE']):
+                  
+                symbols.append({
+                    'symbol': symbol,
+                    'price': price,
+                    'change': change,
+                    'volume': vol
+                })
+        except:
+            continue
+  
+    # Sort by price change for momentum focus
+    symbols.sort(key=lambda x: abs(x['change']), reverse=True)
+    return [s['symbol'] for s in symbols[:80]]
+
+# ==================== DATA FETCHING ====================
+def fetch_klines(exchange, symbol, interval, limit=CONFIG['KLINE_LIMIT']):
+    """Fetch kline data with proper validation"""
+    try:
+        if exchange == 'binance':
+            url = 'https://api.binance.com/api/v3/klines'
+            interval_map = {
+                '15m': '15m',
+                '1h': '1h',
+                '4h': '4h'
+            }
+            binance_interval = interval_map.get(interval, '1h')
+            params = {'symbol': symbol, 'interval': binance_interval, 'limit': limit}
+            data = api_client.fetch_json(url, params)
+            if not data:
+                return None
+      
+            df = pd.DataFrame(data, columns=[
+                'open_time', 'open', 'high', 'low', 'close', 'volume',
+                'close_time', 'quote_asset_volume', 'trades',
+                'taker_buy_base', 'taker_buy_quote', 'ignore'
+            ])
+            df = df[['open_time', 'open', 'high', 'low', 'close', 'volume']]
+            df['open_time'] = pd.to_datetime(df['open_time'], unit='ms')
+      
+            numeric_cols = ['open', 'high', 'low', 'close', 'volume']
+            df[numeric_cols] = df[numeric_cols].astype(float)
+      
+            return df
+                
+        elif exchange == 'bitget':
+            now = int(time.time() * 1000)
+            gran_map = {'15m': '15min', '1h': '1hour', '4h': '4hour'}
+            gran = gran_map.get(interval, '1hour')
+            gran_ms = {
+                '15min': 15*60*1000, 
+                '1hour': 60*60*1000, 
+                '4hour': 240*60*1000
+            }.get(gran, 60*60*1000)
+            
+            startTime = now - (limit * gran_ms)
+            endTime = now
+            
+            url = 'https://api.bitget.com/api/v2/spot/market/candles'
+            params = {
+                'symbol': symbol.replace('_', ''),
+                'granularity': gran, 
+                'startTime': startTime, 
+                'endTime': endTime
+            }
+            
+            response = api_client.fetch_json(url, params)
+            if not response or 'data' not in response:
+                return None
+                
+            data = response['data']
+            if not data:
+                return None
+                
+            df = pd.DataFrame(data, columns=['open_time', 'open', 'high', 'low', 'close', 'volume', 'quote_volume'])
+            df = df[['open_time', 'open', 'high', 'low', 'close', 'volume']]
+            df['open_time'] = pd.to_datetime(df['open_time'].astype(float).astype(int), unit='ms')
+            
+            numeric_cols = ['open', 'high', 'low', 'close', 'volume']
+            df[numeric_cols] = df[numeric_cols].astype(float)
+            return df
+  
+    except Exception as e:
+        return None
+
+# ==================== ESSENTIAL INDICATORS ====================
+def calculate_indicators(df):
+    """Calculate essential indicators with ACCURATE RSI"""
+    df = df.copy()
+    
+    if len(df) < 100:
+        return df
+  
+    # 1. DMI/ADX
+    period = 14
+    high_diff = df['high'].diff()
+    low_diff = -df['low'].diff()
+  
+    df['+DM'] = np.where((high_diff > low_diff) & (high_diff > 0), high_diff, 0)
+    df['-DM'] = np.where((low_diff > high_diff) & (low_diff > 0), low_diff, 0)
+  
+    # True Range
+    tr1 = df['high'] - df['low']
+    tr2 = abs(df['high'] - df['close'].shift(1))
+    tr3 = abs(df['low'] - df['close'].shift(1))
+    df['TR'] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+  
+    # Wilder's smoothing
+    alpha = 1 / period
+    df['+DI'] = 100 * (df['+DM'].ewm(alpha=alpha, adjust=False).mean() /
+                       df['TR'].ewm(alpha=alpha, adjust=False).mean())
+    df['-DI'] = 100 * (df['-DM'].ewm(alpha=alpha, adjust=False).mean() /
+                       df['TR'].ewm(alpha=alpha, adjust=False).mean())
+  
+    # ADX
+    dx = 100 * abs(df['+DI'] - df['-DI']) / (df['+DI'] + df['-DI']).replace(0, 0.0001)
+    df['ADX'] = dx.ewm(alpha=alpha, adjust=False).mean()
+  
+    # 2. ACCURATE RSI CALCULATION
+    prices = df['close'].values
+    rsi_values = calculate_rsi_accurate(prices, period=14)
+    df['RSI'] = rsi_values
+    
+    # 3. Volume Analysis
+    df['Volume_MA'] = df['volume'].rolling(window=20).mean()
+    df['Volume_Ratio'] = df['volume'] / df['Volume_MA'].replace(0, 0.0001)
+  
+    # 4. Moving Averages
+    df['MA9'] = df['close'].rolling(window=9).mean()
+    df['MA20'] = df['close'].rolling(window=20).mean()
+  
+    # 5. MACD
+    ema12 = df['close'].ewm(span=12, adjust=False).mean()
+    ema26 = df['close'].ewm(span=26, adjust=False).mean()
+    df['MACD'] = ema12 - ema26
+    df['MACD_Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
+  
+    # 6. Support/Resistance
+    df['Resistance'] = df['high'].rolling(window=20).max()
+    df['Support'] = df['low'].rolling(window=20).min()
+  
+    return df
+
+# ==================== SIGNAL DETECTION ====================
+def check_dmi_signal(df):
+    if len(df) < 10:
+        return 0, []
+  
+    latest = df.iloc[-1]
+    prev = df.iloc[-2]
+  
+    score = 0
+    signals = []
+  
+    # +DI above -DI (30 points)
+    if latest['+DI'] > latest['-DI']:
+        score += 30
+        signals.append("DMI_BULLISH")
+      
+        # Check for recent crossover (20 points)
+        if prev['+DI'] <= prev['-DI']:
+            score += 20
+            signals.append("DMI_CROSSOVER")
+  
+    # ADX strength (25 points)
+    if latest['ADX'] > 30:
+        score += 25
+        signals.append("ADX_STRONG")
+    elif latest['ADX'] > 25:
+        score += 20
+        signals.append("ADX_GOOD")
+    elif latest['ADX'] > 20:
+        score += 15
+        signals.append("ADX_OK")
+  
+    # DMI difference strength (15 points)
+    dmi_diff = latest['+DI'] - latest['-DI']
+    if dmi_diff > 15:
+        score += 15
+        signals.append("DMI_STRONG_DIFF")
+    elif dmi_diff > 10:
+        score += 10
+        signals.append("DMI_GOOD_DIFF")
+    elif dmi_diff > 5:
+        score += 5
+        signals.append("DMI_WEAK_DIFF")
+  
+    return min(score, 70), signals
+
+def check_momentum_signal(df):
+    """Check momentum signals - FOCUS ON HIGH RSI"""
+    latest = df.iloc[-1]
+    prev = df.iloc[-2]
+  
+    score = 0
+    signals = []
+  
+    # RSI (25 points) - ONLY HIGH RSI
+    rsi = latest['RSI']
+    if pd.isna(rsi):
+        return 0, []
+        
+    # High RSI gets maximum points
+    if rsi >= 80:
+        score += 25
+        signals.append("RSI_EXTREME")
+    elif rsi >= 75:
+        score += 20
+        signals.append("RSI_STRONG")
+    elif rsi >= 70:
+        score += 15
+        signals.append("RSI_HIGH")
+    else:
+        return 0, []  # Reject if RSI < 70
+  
+    # MACD (15 points)
+    if latest['MACD'] > latest['MACD_Signal']:
+        score += 15
+        signals.append("MACD_BULLISH")
+        if prev['MACD'] <= prev['MACD_Signal']:
+            score += 10
+            signals.append("MACD_CROSSOVER")
+  
+    # Price above MAs (10 points)
+    if latest['close'] > latest['MA9'] > latest['MA20']:
+        score += 10
+        signals.append("TREND_ALIGNED")
+    elif latest['close'] > latest['MA20']:
+        score += 5
+        signals.append("ABOVE_MA20")
+  
+    return min(score, 50), signals
+
+def check_volume_signal(df):
+    latest = df.iloc[-1]
+  
+    score = 0
+    signals = []
+  
+    # Volume spike (25 points)
+    vol_ratio = latest['Volume_Ratio']
+    if pd.isna(vol_ratio):
+        return 0, []
+        
+    if vol_ratio > 3.0:
+        score += 25
+        signals.append("VOL_EXPLOSION")
+    elif vol_ratio > 2.0:
+        score += 20
+        signals.append("VOL_SURGE")
+    elif vol_ratio > 1.5:
+        score += 15
+        signals.append("VOL_HIGH")
+    elif vol_ratio > 1.2:
+        score += 5
+        signals.append("VOL_GOOD")
+  
+    return min(score, 25), signals
+
+def check_price_action(df):
+    latest = df.iloc[-1]
+    prev = df.iloc[-2]
+  
+    score = 0
+    signals = []
+  
+    # Price change (15 points)
+    price_change = ((latest['close'] - prev['close']) / prev['close']) * 100
+    if price_change > 5:
+        score += 15
+        signals.append("PRICE_SURGE")
+    elif price_change > 2:
+        score += 10
+        signals.append("PRICE_UP")
+    elif price_change > 0:
+        score += 5
+        signals.append("PRICE_SLIGHT_UP")
+  
+    # Breakout potential (10 points)
+    resistance_distance = ((latest['Resistance'] - latest['close']) / latest['close']) * 100
+    if resistance_distance > 10:
+        score += 10
+        signals.append("ROOM_TO_RUN")
+    elif resistance_distance > 5:
+        score += 5
+        signals.append("SOME_ROOM")
+  
+    return min(score, 25), signals
+
+def check_liquidity_grab_pullback(df):
+    if len(df) < 10:
+        return 0, [], False
+  
+    score = 0
+    signals = []
+    detected = False
+  
+    lookback = 8
+    support_window = 20
+  
+    for i in range(1, lookback + 1):
+        if len(df) < i + support_window:
+            continue
+      
+        bar = df.iloc[-i]
+        prev_df = df.iloc[-i - support_window : -i]
+        prev_support = prev_df['low'].min()
+      
+        body = abs(bar['close'] - bar['open'])
+        lower_wick = min(bar['open'], bar['close']) - bar['low']
+        wick_ratio = lower_wick / body if body > 0 else 0
+      
+        if (bar['low'] < prev_support and
+            bar['close'] > prev_support and
+            bar['Volume_Ratio'] > CONFIG['MIN_VOLUME_SPIKE'] and
+            wick_ratio > 1.0):
+          
+            post_grab = df.iloc[-i+1:]
+            if len(post_grab) >= 1:
+                recovery = ((post_grab['close'].max() - bar['low']) / bar['low']) * 100
+                if recovery > 1.5:
+                    score += 20 if recovery > 4 else 15 if recovery > 2.5 else 10
+                    signals.append(f"LIQ_GRAB_PB_{int(recovery)}%")
+                    detected = True
+                    break
+  
+    return min(score, 20), signals, detected
+
+# ==================== FIXED SCANNING ====================
+def scan_symbol(exchange, symbol, interval='1h'):
+    """Scan a single symbol - ONLY RSI 70+"""
+    try:
+        # Fetch data
+        df = fetch_klines(exchange, symbol, interval)
+        if df is None or len(df) < 100:
+            return None
+      
+        # Calculate indicators
+        df = calculate_indicators(df)
+        latest = df.iloc[-1]
+        
+        # Check for NaN values
+        if (pd.isna(latest['RSI']) or pd.isna(latest['ADX']) or 
+            pd.isna(latest['Volume_Ratio']) or pd.isna(latest['+DI'])):
+            return None
+      
+        # ===== BASIC FILTERS =====
+        # Price filter
+        if not (CONFIG['MIN_PRICE'] < latest['close'] < CONFIG['MAX_PRICE']):
+            return None
+      
+        # ADX filter
+        if latest['ADX'] < CONFIG['MIN_ADX']:
+            return None
+      
+        # +DI must be above -DI
+        if latest['+DI'] <= latest['-DI']:
+            return None
+      
+        # DMI difference filter
+        dmi_diff = latest['+DI'] - latest['-DI']
+        if dmi_diff < CONFIG['MIN_DMI_DIFF']:
+            return None
+      
+        # Volume filter
+        if latest['Volume_Ratio'] < CONFIG['MIN_VOLUME_SPIKE']:
+            return None
+      
+        # RSI FILTER - ONLY 70+
+        if not (CONFIG['MIN_RSI'] <= latest['RSI'] <= CONFIG['MAX_RSI']):
+            return None
+      
+        # ===== CALCULATE SCORES =====
+        dmi_score, dmi_signals = check_dmi_signal(df)
+        mom_score, mom_signals = check_momentum_signal(df)
+        
+        # If RSI < 70, momentum score will be 0 and we return None
+        if mom_score == 0:
+            return None
+            
+        vol_score, vol_signals = check_volume_signal(df)
+        price_score, price_signals = check_price_action(df)
+        liq_score, liq_signals, liq_detected = check_liquidity_grab_pullback(df)
+      
+        # Total Score
+        total_score = dmi_score + mom_score + vol_score + price_score + liq_score
+      
+        # Minimum score filter
+        if total_score < CONFIG['MIN_SCORE']:
+            return None
+      
+        # ===== PREPARE RESULT =====
+        if total_score >= 85:
+            strength = "🚀 PERFECT"
+            emoji = "🟢"
+        elif total_score >= 75:
+            strength = "🔥 STRONG"
+            emoji = "🟡"
+        elif total_score >= 65:
+            strength = "⚡ GOOD"
+            emoji = "🔵"
+        else:
+            strength = "⚠️ WATCH"
+            emoji = "⚪"
+      
+        all_signals = dmi_signals + mom_signals + vol_signals + price_signals + liq_signals
+        unique_signals = list(set(all_signals))
+      
+        return {
+            'exchange': exchange.upper(),
+            'symbol': symbol,
+            'tf': interval.upper(),
+            'score': total_score,
+            'strength': strength,
+            'emoji': emoji,
+            'price': latest['close'],
+            'change': ((latest['close'] - df.iloc[-2]['close']) / df.iloc[-2]['close']) * 100,
+            'adx': latest['ADX'],
+            'rsi': latest['RSI'],
+            'dmi_diff': dmi_diff,
+            'volume_ratio': latest['Volume_Ratio'],
+            'liq_grab': liq_detected,
+            'signal_count': len(unique_signals),
+            'top_signals': ', '.join(unique_signals[:4]),
+            'time': datetime.now().strftime('%H:%M')
+        }
+      
+    except Exception as e:
+        return None
+
+# ==================== MULTI-TIMEFRAME SCAN ====================
+def scan_multi_timeframe(exchange, symbol):
+    timeframes = ['15m', '1h', '4h']
+    best_score = 0
+    best_result = None
+  
+    for tf in timeframes:
+        result = scan_symbol(exchange, symbol, tf)
+        if result and result['score'] > best_score:
+            best_score = result['score']
+            best_result = result
+  
+    return best_result
+
+# ==================== VERIFY RSI FUNCTION ====================
+def verify_rsi_accuracy():
+    """Function to verify RSI matches live market"""
+    print("\n" + "="*60)
+    print("🧪 VERIFYING RSI ACCURACY")
+    print("="*60)
+    
+    # Test with known symbols
+    test_symbols = [
+        ('binance', 'BTCUSDT'),
+        ('binance', 'ETHUSDT'),
+        ('binance', 'BNBUSDT'),
+        ('binance', 'ADAUSDT'),
+    ]
+    
+    for exchange, symbol in test_symbols:
+        print(f"\n📊 Testing {symbol}...")
+        df = fetch_klines(exchange, symbol, '1h', limit=100)
+        if df is not None:
+            df = calculate_indicators(df)
+            latest_rsi = df['RSI'].iloc[-1]
+            latest_price = df['close'].iloc[-1]
+            price_change = ((latest_price - df['close'].iloc[-2]) / df['close'].iloc[-2]) * 100
+            
+            # RSI color coding
+            if latest_rsi >= 70:
+                rsi_display = f"🟢 {latest_rsi:.1f}"
+            elif latest_rsi >= 50:
+                rsi_display = f"🟡 {latest_rsi:.1f}"
+            else:
+                rsi_display = f"🔴 {latest_rsi:.1f}"
+                
+            print(f"  Price: ${latest_price:.2f} | Change: {price_change:+.2f}%")
+            print(f"  RSI: {rsi_display}")
+            
+            # Additional info for high RSI
+            if latest_rsi >= 70:
+                print(f"  ⚠️  WARNING: Overbought (RSI ≥ 70)")
+                print(f"  📈 Volume Ratio: {df['Volume_Ratio'].iloc[-1]:.2f}x")
+                print(f"  🎯 ADX: {df['ADX'].iloc[-1]:.1f}")
+    
+    print("\n✅ RSI verification complete.")
+    print("Compare these values with TradingView/Binance.")
+    print("They should match within ±1 point.")
+
+# ==================== MAIN SCANNER ====================
+def run_pump_scanner():
+    print("\n" + "="*80)
+    print("🔥 HIGH RSI PUMP DETECTION SCANNER")
+    print(" ONLY RSI 70+ (OVERSOLD) COINS")
+    print("="*80)
+  
+    print("\n📊 Loading symbols...")
+    symbols = []
+    for ex in ['binance', 'bitget']:
+        print(f"Loading from {ex.upper()}...")
+        syms = get_lowcap_symbols(ex)
+        symbols.extend([(ex, s) for s in syms])
+    print(f"✅ Found {len(symbols)} potential candidates")
+  
+    print("\n🔍 Scanning for HIGH RSI (70+) setups...")
+  
+    results = []
+    with ThreadPoolExecutor(max_workers=CONFIG['THREADS']) as executor:
+        futures = [executor.submit(scan_multi_timeframe, ex, sym) for ex, sym in symbols[:80]]
+      
+        for i, future in enumerate(as_completed(futures), 1):
+            if i % 10 == 0:
+                print(f" Progress: {i}/{len(futures)}")
+          
+            result = future.result()
+            if result:
+                results.append(result)
+  
+    return results
+
+# ==================== DISPLAY RESULTS ====================
+def display_results(results):
+    if not results:
+        print("\n❌ No HIGH RSI (70+) setups found.")
+        print(" Try again in a few minutes or adjust filters.")
+        return []
+  
+    results.sort(key=lambda x: x['score'], reverse=True)
+    top_results = results[:20]  # Show more results
+  
+    print(f"\n{'='*120}")
+    print(f"🎯 HIGH RSI (70+) PUMP CANDIDATES - {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"{'='*120}")
+  
+    display_data = []
+    for r in top_results:
+        price = r['price']
+        if price < 0.001:
+            price_str = f"${price:.6f}"
+        elif price < 0.01:
+            price_str = f"${price:.5f}"
+        elif price < 0.1:
+            price_str = f"${price:.4f}"
+        else:
+            price_str = f"${price:.3f}"
+      
+        change = r['change']
+        change_color = "🟢" if change > 0 else "🔴"
+      
+        # RSI coloring
+        rsi = r['rsi']
+        if rsi >= 80:
+            rsi_color = "🔴"
+        elif rsi >= 75:
+            rsi_color = "🟠"
+        elif rsi >= 70:
+            rsi_color = "🟡"
+        else:
+            rsi_color = "🟢"
+      
+        vol_ratio = r['volume_ratio']
+        if vol_ratio > 3:
+            vol_indicator = "💥"
+        elif vol_ratio > 2:
+            vol_indicator = "🔥"
+        else:
+            vol_indicator = "📈"
+      
+        liq_indicator = "✅" if r['liq_grab'] else "❌"
+      
+        display_data.append({
+            '#': len(display_data) + 1,
+            'Exchange': r['exchange'],
+            'Symbol': r['symbol'],
+            'TF': r['tf'],
+            'Score': f"{r['emoji']} {r['score']:.0f}",
+            'Price': price_str,
+            'Change': f"{change_color} {change:+.1f}%",
+            'RSI': f"{rsi_color} {r['rsi']:.1f}",
+            'ADX': f"{r['adx']:.1f}",
+            'DMI': f"+{r['dmi_diff']:.1f}",
+            'Volume': f"{vol_indicator} {vol_ratio:.1f}x",
+            'LiqGrab': liq_indicator,
+        })
+  
+    df_display = pd.DataFrame(display_data)
+    pd.set_option('display.width', 120)
+    pd.set_option('display.max_colwidth', 10)
+  
+    print(df_display.to_string(index=False))
+    print("\n" + "="*120)
+  
+    # Show top 3 in detail
+    if top_results:
+        print("\n🏆 TOP 3 HIGH RSI SETUPS:")
+        for i, r in enumerate(top_results[:3], 1):
+            print(f"\n{i}. {r['symbol']} ({r['tf']}) - Score: {r['score']:.0f} ({r['strength']})")
+            print(f"   Price: ${r['price']:.6f} | 24h Change: {r['change']:+.2f}%")
+            print(f"   RSI: {r['rsi']:.1f} | ADX: {r['adx']:.1f} | DMI Diff: +{r['dmi_diff']:.1f}")
+            print(f"   Volume: {r['volume_ratio']:.1f}x | Liquidity Grab: {'Yes' if r['liq_grab'] else 'No'}")
+            print(f"   Signals: {r['top_signals']}")
+    
+    # Statistics
+    if results:
+        avg_rsi = sum(r['rsi'] for r in results) / len(results)
+        avg_volume = sum(r['volume_ratio'] for r in results) / len(results)
+        high_rsi_count = sum(1 for r in results if r['rsi'] >= 75)
+        
+        print(f"\n📊 SCAN STATISTICS:")
+        print(f" Total Signals Found: {len(results)}")
+        print(f" Average RSI: {avg_rsi:.1f}")
+        print(f" Average Volume: {avg_volume:.1f}x")
+        print(f" Extreme RSI (≥75): {high_rsi_count}")
+        print(f" Liquidity Grab Patterns: {sum(1 for r in results if r['liq_grab'])}")
+    
+    print("\n⚠️  WARNING: High RSI (≥70) indicates overbought conditions.")
+    print(" Consider waiting for pullback or use tight stop-loss.")
+  
+    return top_results
+
+# ==================== MAIN ====================
+def main():
+    print("\n" + "="*70)
+    print("🔥 HIGH RSI PUMP FINDER SCANNER")
+    print(" ONLY RSI 70+ COINS (OVERBOUGHT)")
+    print("="*70)
+  
+    # First verify RSI accuracy
+    verify_rsi_accuracy()
+    
+    print("\n" + "="*70)
+    print("SCANNING CRITERIA:")
+    print("• RSI MUST BE 70-85 (Overbought)")
+    print("• DMI crossover (+DI above -DI)")
+    print("• ADX > 20 (strong trend)")
+    print("• Volume surge (>1.5x average)")
+    print("• Low price (<$0.5)")
+    print("="*70)
+  
+    seen = set()
+    scan_count = 0
+    
+    while True:
+        try:
+            scan_count += 1
+            print(f"\n🔄 SCAN #{scan_count} - {datetime.now().strftime('%H:%M:%S')}")
+            
+            results = run_pump_scanner()
+            if results:
+                results.sort(key=lambda x: x['score'], reverse=True)
+                
+                # Show new alerts
+                new_alerts = []
+                for r in results:
+                    key = (r['exchange'], r['symbol'], r['tf'])
+                    if key not in seen:
+                        new_alerts.append(r)
+                        seen.add(key)
+                
+                if new_alerts:
+                    print(f"\n🚨 NEW ALERTS FOUND: {len(new_alerts)}")
+                    for r in new_alerts:
+                        price = r['price']
+                        if price < 0.001:
+                            price_str = f"${price:.6f}"
+                        elif price < 0.01:
+                            price_str = f"${price:.5f}"
+                        elif price < 0.1:
+                            price_str = f"${price:.4f}"
+                        else:
+                            price_str = f"${price:.3f}"
+                        
+                        alert = f"{r['exchange']} {r['symbol']} {r['tf']} | RSI:{r['rsi']:.1f} | Score:{r['score']} | ${price_str} | Change:{r['change']:+.1f}% | Vol:{r['volume_ratio']:.1f}x"
+                        print(f"   ⚡ {alert}")
+                
+                # Always display full results
+                top_results = display_results(results)
+            else:
+                print("\n📭 No HIGH RSI setups found this scan.")
+            
+            print(f"\n⏳ Next scan in 3 minutes...")
+            time.sleep(180)  # 3 minutes
+            
+        except KeyboardInterrupt:
+            print("\n\n⏹️ Stopped by user.")
+            break
+        except Exception as e:
+            print(f"\n❌ Error: {e}")
+            time.sleep(60)
+
+# ==================== RUN ====================
+if __name__ == "__main__":
+    main()
